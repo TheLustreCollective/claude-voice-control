@@ -9,6 +9,8 @@ It launches the real interactive Claude Code terminal through
 ## What it does today
 
 - starts named sessions in the background;
+- associates every session with the working directory where Claude Code runs;
+- keeps durable human-readable notes and arbitrary JSON metadata per session;
 - stores their stable Claude session IDs and event logs locally;
 - reports running, idle, failed, and stopped state without replaying an entire
   terminal transcript;
@@ -32,6 +34,8 @@ onboarding dialogs from blocking headless managed sessions.
 ```bash
 python3 -m claude_voice_control start research \
   --cwd /path/to/project \
+  --notes "Investigating the flaky integration suite" \
+  --metadata '{"ticket":"TLU-222","priority":"low"}' \
   --prompt "Inspect the repository and report the test layout."
 
 python3 -m claude_voice_control list
@@ -39,6 +43,10 @@ python3 -m claude_voice_control status research
 python3 -m claude_voice_control send research \
   --prompt "Now identify the three most important tests to run."
 python3 -m claude_voice_control stop research
+
+# Add a note or metadata later, without disrupting the session.
+python3 -m claude_voice_control update research \
+  --merge-metadata '{"owner":"Patrick"}'
 ```
 
 By default state is private and local under
@@ -65,3 +73,11 @@ Each named session has one active turn at a time:
 Events are append-only JSONL logs. `status` reads only the recent tail and
 extracts the most recent assistant text/result, so normal control calls do
 not need to load a full Claude conversation.
+
+## Session identity and context
+
+`start` requires a simple session name and `--cwd`. The name is the durable
+control handle; the working directory never changes when the session is
+resumed. `--notes` is free-form text for human context, while `--metadata`
+stores a JSON object for structured routing details such as an issue key,
+owner, or project type. Both are included in `list` and `status` output.

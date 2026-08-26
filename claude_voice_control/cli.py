@@ -8,7 +8,7 @@ import subprocess
 import sys
 import time
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +23,8 @@ class Session:
     cwd: str
     log_path: str
     state: str
+    notes: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
     pid: int | None = None
     created_at: float = 0.0
     updated_at: float = 0.0
@@ -42,7 +44,12 @@ class Manager:
         if not self.registry_path.exists():
             return {}
         raw = json.loads(self.registry_path.read_text())
-        return {name: Session(**value) for name, value in raw.items()}
+        sessions = {}
+        for name, value in raw.items():
+            value.setdefault("notes", "")
+            value.setdefault("metadata", {})
+            sessions[name] = Session(**value)
+        return sessions
 
     def _save(self, sessions: dict[str, Session]) -> None:
         pending = self.registry_path.with_suffix(".tmp")
@@ -85,12 +92,20 @@ class Manager:
             self._save(sessions)
         return sessions
 
-    def run_turn(self, name: str, prompt: str, cwd: Path | None = None) -> Session:
+    def run_turn(
+        self,
+        name: str,
+        prompt: str,
+        cwd: Path | None = None,
+        notes: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> Session:
         sessions = self.sessions()
         session = sessions.get(name)
         if session and session.state == "running":
             raise ValueError(f"session '{name}' already has a running turn")
         if session is None:
+            _validate_name(name)
             if cwd is None:
                 cwd = Path.cwd()
             cwd = cwd.resolve()
@@ -100,6 +115,8 @@ class Manager:
                 cwd=str(cwd),
                 log_path=str(self.logs_dir / f"{name}.jsonl"),
                 state="idle",
+                notes=notes or "",
+                metadata=metadata or {},
                 created_at=time.time(),
                 updated_at=time.time(),
             )
@@ -132,6 +149,28 @@ class Manager:
         session.pid = process.pid
         session.state = "running"
         session.last_error = None
+        session.updated_at = time.time()
+        sessions[name] = session
+        self._save(sessions)
+        return session
+
+    def update(
+        self,
+        name: str,
+        notes: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        merge_metadata: dict[str, Any] | None = None,
+    ) -> Session:
+        sessions = self.sessions()
+        session = sessions.get(name)
+        if not session:
+            raise ValueError(f"unknown session '{name}'")
+        if notes is not None:
+            session.notes = notes
+        if metadata is not None:
+            session.metadata = metadata
+        if merge_metadata is not None:
+            session.metadata = {**(session.metadata or {}), **merge_metadata}
         session.updated_at = time.time()
         sessions[name] = session
         self._save(sessions)
@@ -208,6 +247,11 @@ def _tail_lines(path: Path, limit: int = 200, max_bytes: int = 256 * 1024) -> li
     return chunk.splitlines()[-limit:]
 
 
+def _validate_name(name: str) -> None:
+    if not name or name in {".", ".."} or "/" in name or "\\" in name:
+        raise ValueError("session name must be a non-empty simple label")
+
+
 def _print_session(session: Session, include_summary: bool = False) -> None:
     data = asdict(session)
     if include_summary:
@@ -224,6 +268,8 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("name")
     start.add_argument("--cwd", type=Path, required=True)
     start.add_argument("--prompt", required=True)
+    start.add_argument("--notes", default="", help="free-form durable context for this session")
+    start.add_argument("--metadata", type=_json_object, default={}, help="JSON object stored with the session")
     send = sub.add_parser("send", help="send a follow-up prompt to an idle session")
     send.add_argument("name")
     send.add_argument("--prompt", required=True)
@@ -232,6 +278,11 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("name")
     stop = sub.add_parser("stop", help="stop the active turn")
     stop.add_argument("name")
+    update = sub.add_parser("update", help="update session notes or metadata")
+    update.add_argument("name")
+    update.add_argument("--notes", help="replace notes (pass an empty value to clear)")
+    update.add_argument("--metadata", type=_json_object, help="replace metadata with a JSON object")
+    update.add_argument("--merge-metadata", type=_json_object, help="merge a JSON object into metadata")
     logs = sub.add_parser("events", help="print a bounded recent event tail")
     logs.add_argument("name")
     logs.add_argument("--lines", type=int, default=40)
@@ -243,7 +294,7 @@ def main(argv: list[str] | None = None) -> int:
     manager = Manager(args.state_dir, args.cctty)
     try:
         if args.command == "start":
-            _print_session(manager.run_turn(args.name, args.prompt, args.cwd))
+            _print_session(manager.run_turn(args.name, args.prompt, args.cwd, args.notes, args.metadata))
         elif args.command == "send":
             _print_session(manager.run_turn(args.name, args.prompt))
         elif args.command == "list":
@@ -255,6 +306,8 @@ def main(argv: list[str] | None = None) -> int:
             _print_session(session, include_summary=True)
         elif args.command == "stop":
             _print_session(manager.stop(args.name))
+        elif args.command == "update":
+            _print_session(manager.update(args.name, args.notes, args.metadata, args.merge_metadata))
         elif args.command == "events":
             session = manager.sessions().get(args.name)
             if not session:
@@ -265,6 +318,16 @@ def main(argv: list[str] | None = None) -> int:
         print(f"claude-voice-control: {exc}", file=sys.stderr)
         return 2
     return 0
+
+
+def _json_object(value: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError(f"invalid JSON: {exc.msg}") from exc
+    if not isinstance(parsed, dict):
+        raise argparse.ArgumentTypeError("metadata must be a JSON object")
+    return parsed
 
 
 if __name__ == "__main__":

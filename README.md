@@ -5,6 +5,8 @@ Small, local control plane for several Claude Code sessions.
 It launches the real interactive Claude Code terminal through
 [cctty](https://github.com/Pyiner/cctty), but consumes cctty's structured
 `stream-json` output. That avoids treating a terminal screen as an API.
+Prompts also use Claude's streaming JSON input protocol, which makes
+resume/restart a real continuation of the named Claude conversation.
 
 ## What it does today
 
@@ -44,6 +46,14 @@ python3 -m claude_voice_control send research \
   --prompt "Now identify the three most important tests to run."
 python3 -m claude_voice_control stop research
 
+# Move a completed session out of the active table; its logs and context remain.
+python3 -m claude_voice_control archive research
+python3 -m claude_voice_control list --archived
+python3 -m claude_voice_control unarchive research
+
+# Resume the original Claude conversation, optionally with a new instruction.
+python3 -m claude_voice_control restart research --prompt "Continue from the last findings."
+
 # Add a note or metadata later, without disrupting the session.
 python3 -m claude_voice_control update research \
   --merge-metadata '{"owner":"Patrick"}'
@@ -73,6 +83,15 @@ Each named session has one active turn at a time:
 - `idle` — the most recent turn completed and the session can be resumed;
 - `failed` — cctty exited unsuccessfully; and
 - `stopped` — the manager terminated the active turn.
+
+Sessions are active by default. `archive` moves a non-running session out of
+the default `list` view without deleting its registry entry, JSONL log, or
+Claude session ID. `list --archived` and `list --all` expose historical
+records. `unarchive` returns one to the active set. `restart` resumes the
+original Claude conversation after a completed, failed, or stopped turn. It
+does not revive an old OS process: it starts a fresh cctty/Claude process with
+`--resume <stored-Claude-session-ID>` and Claude's streaming JSON input
+protocol, so the new instruction is processed in the restored conversation.
 
 Events are append-only JSONL logs. `status` reads only the recent tail and
 extracts the most recent assistant text/result, so normal control calls do

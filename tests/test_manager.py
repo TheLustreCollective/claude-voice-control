@@ -1,3 +1,4 @@
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -41,6 +42,24 @@ class ManagerTests(unittest.TestCase):
         self.assertIn("claude-opus-5", table)
         self.assertIn("/work/demo", table)
         self.assertIn("Investigate", table)
+
+    def test_archive_and_unarchive_preserve_history(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = Manager(Path(directory) / "state", "cctty")
+            example = Session("demo", "session-1", "/tmp", "/tmp/demo.jsonl", "idle")
+            manager._save({"demo": example})
+            archived = manager.archive("demo")
+            self.assertIsNotNone(archived.archived_at)
+            self.assertEqual(manager.sessions()["demo"].session_id, "session-1")
+            active = manager.unarchive("demo")
+            self.assertIsNone(active.archived_at)
+
+    def test_archive_rejects_running_session(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = Manager(Path(directory) / "state", "cctty")
+            manager._save({"demo": Session("demo", "session-1", "/tmp", "/tmp/demo.jsonl", "running", pid=os.getpid())})
+            with self.assertRaisesRegex(ValueError, "stop a running"):
+                manager.archive("demo")
 
     def test_bootstrap_prompt_is_private_durable_config(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

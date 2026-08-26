@@ -34,6 +34,7 @@ class Session:
     active_seconds: float = 0.0
     model: str | None = None
     last_error: str | None = None
+    archived_at: float | None = None
 
 
 class Manager:
@@ -58,6 +59,7 @@ class Manager:
             value.setdefault("turn_started_at", None)
             value.setdefault("active_seconds", 0.0)
             value.setdefault("model", None)
+            value.setdefault("archived_at", None)
             sessions[name] = Session(**value)
         return sessions
 
@@ -169,13 +171,17 @@ class Manager:
         command = [
             self.cctty,
             "--print",
+            "--input-format",
+            "stream-json",
             "--output-format",
             "stream-json",
             "--no-chrome",
-            "--session-id",
-            session.session_id,
-            effective_prompt,
         ]
+        if is_new:
+            command.extend(["--session-id", session.session_id])
+        else:
+            command.extend(["--resume", session.session_id])
+        command.append(effective_prompt)
         session.metadata = {
             **(session.metadata or {}),
             "startup_command": [*command[:-1], "<prompt>"],
@@ -187,11 +193,21 @@ class Manager:
             process = subprocess.Popen(
                 command,
                 cwd=session.cwd,
-                stdin=subprocess.DEVNULL,
+                stdin=subprocess.PIPE,
                 stdout=output,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
+            assert process.stdin is not None
+            stream_input = {
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": effective_prompt}],
+                },
+            }
+            process.stdin.write((json.dumps(stream_input) + "\n").encode())
+            process.stdin.close()
             _write_manager_event(output, "turn_started", session, pid=process.pid)
         session.pid = process.pid
         session.state = "running"
@@ -242,6 +258,44 @@ class Manager:
         sessions[name] = session
         self._save(sessions)
         return session
+
+    def archive(self, name: str) -> Session:
+        sessions = self.sessions()
+        session = sessions.get(name)
+        if not session:
+            raise ValueError(f"unknown session '{name}'")
+        if session.state == "running":
+            raise ValueError("stop a running session before archiving it")
+        session.archived_at = time.time()
+        session.updated_at = session.archived_at
+        sessions[name] = session
+        self._save(sessions)
+        return session
+
+    def unarchive(self, name: str) -> Session:
+        sessions = self.sessions()
+        session = sessions.get(name)
+        if not session:
+            raise ValueError(f"unknown session '{name}'")
+        session.archived_at = None
+        session.updated_at = time.time()
+        sessions[name] = session
+        self._save(sessions)
+        return session
+
+    def restart(self, name: str, prompt: str | None = None) -> Session:
+        sessions = self.sessions()
+        session = sessions.get(name)
+        if not session:
+            raise ValueError(f"unknown session '{name}'")
+        if session.state == "running":
+            raise ValueError(f"session '{name}' already has a running turn")
+        if session.archived_at is not None:
+            raise ValueError("unarchive the session before restarting it")
+        return self.run_turn(
+            name,
+            prompt or "Resume this session. Review the current context and continue the work from where it stopped.",
+        )
 
 
 def _last_result(log_path: Path) -> dict[str, Any] | None:
@@ -343,7 +397,7 @@ def _print_session(session: Session, include_summary: bool = False) -> None:
 
 
 def _format_table(sessions: list[Session]) -> str:
-    columns = ["Name", "State", "Model", "Started", "Last message", "Active", "Directory", "Notes"]
+    columns = ["Name", "State", "Archive", "Model", "Started", "Last message", "Active", "Directory", "Notes"]
     rows = []
     now = time.time()
     for session in sessions:
@@ -351,6 +405,7 @@ def _format_table(sessions: list[Session]) -> str:
         rows.append([
             session.name,
             session.state,
+            "archived" if session.archived_at else "active",
             session.model or "—",
             _format_time(session.created_at),
             _format_time(session.last_message_at),
@@ -394,10 +449,20 @@ def build_parser() -> argparse.ArgumentParser:
     send.add_argument("--prompt", required=True)
     listing = sub.add_parser("list", help="list all named sessions")
     listing.add_argument("--format", choices=("table", "json"), default="table")
+    listing_scope = listing.add_mutually_exclusive_group()
+    listing_scope.add_argument("--archived", action="store_true", help="show archived sessions only")
+    listing_scope.add_argument("--all", action="store_true", help="show active and archived sessions")
     status = sub.add_parser("status", help="show compact recent status")
     status.add_argument("name")
     stop = sub.add_parser("stop", help="stop the active turn")
     stop.add_argument("name")
+    archive = sub.add_parser("archive", help="hide a completed session from the active list")
+    archive.add_argument("name")
+    unarchive = sub.add_parser("unarchive", help="return a session to the active list")
+    unarchive.add_argument("name")
+    restart = sub.add_parser("restart", help="start a new process that resumes an existing Claude session")
+    restart.add_argument("name")
+    restart.add_argument("--prompt", help="replacement resume instruction")
     update = sub.add_parser("update", help="update session notes or metadata")
     update.add_argument("name")
     update.add_argument("--notes", help="replace notes (pass an empty value to clear)")
@@ -424,6 +489,10 @@ def main(argv: list[str] | None = None) -> int:
             _print_session(manager.run_turn(args.name, args.prompt))
         elif args.command == "list":
             sessions = list(manager.sessions().values())
+            if args.archived:
+                sessions = [session for session in sessions if session.archived_at is not None]
+            elif not args.all:
+                sessions = [session for session in sessions if session.archived_at is None]
             if args.format == "json":
                 print(json.dumps([asdict(session) for session in sessions], indent=2))
             else:
@@ -435,6 +504,12 @@ def main(argv: list[str] | None = None) -> int:
             _print_session(session, include_summary=True)
         elif args.command == "stop":
             _print_session(manager.stop(args.name))
+        elif args.command == "archive":
+            _print_session(manager.archive(args.name))
+        elif args.command == "unarchive":
+            _print_session(manager.unarchive(args.name))
+        elif args.command == "restart":
+            _print_session(manager.restart(args.name, args.prompt))
         elif args.command == "update":
             _print_session(manager.update(args.name, args.notes, args.metadata, args.merge_metadata))
         elif args.command == "events":

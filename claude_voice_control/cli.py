@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import json
 import os
 import signal
@@ -28,6 +29,10 @@ class Session:
     pid: int | None = None
     created_at: float = 0.0
     updated_at: float = 0.0
+    last_message_at: float | None = None
+    turn_started_at: float | None = None
+    active_seconds: float = 0.0
+    model: str | None = None
     last_error: str | None = None
 
 
@@ -48,6 +53,10 @@ class Manager:
         for name, value in raw.items():
             value.setdefault("notes", "")
             value.setdefault("metadata", {})
+            value.setdefault("last_message_at", None)
+            value.setdefault("turn_started_at", None)
+            value.setdefault("active_seconds", 0.0)
+            value.setdefault("model", None)
             sessions[name] = Session(**value)
         return sessions
 
@@ -70,6 +79,7 @@ class Manager:
         return True
 
     def _refresh(self, session: Session) -> Session:
+        self._refresh_observed_fields(session)
         if session.state == "running" and not self._pid_alive(session.pid):
             result = _last_result(Path(session.log_path))
             if result and not result.get("is_error", False):
@@ -78,8 +88,20 @@ class Manager:
                 session.state = "failed"
                 session.last_error = (result or {}).get("result", "cctty exited without a result")
             session.pid = None
-            session.updated_at = time.time()
+            now = time.time()
+            if session.turn_started_at:
+                session.active_seconds += now - session.turn_started_at
+            session.turn_started_at = None
+            session.updated_at = now
         return session
+
+    @staticmethod
+    def _refresh_observed_fields(session: Session) -> None:
+        observed = _recent_observed_fields(Path(session.log_path))
+        if observed["last_message_at"]:
+            session.last_message_at = observed["last_message_at"]
+        if observed["model"]:
+            session.model = observed["model"]
 
     def sessions(self) -> dict[str, Session]:
         sessions = self._load()
@@ -135,6 +157,10 @@ class Manager:
             session.session_id,
             prompt,
         ]
+        session.metadata = {
+            **(session.metadata or {}),
+            "startup_command": [*command[:-1], "<prompt>"],
+        }
         with log.open("ab") as output:
             _write_manager_event(output, "turn_starting", session)
             process = subprocess.Popen(
@@ -149,7 +175,8 @@ class Manager:
         session.pid = process.pid
         session.state = "running"
         session.last_error = None
-        session.updated_at = time.time()
+        session.turn_started_at = time.time()
+        session.updated_at = session.turn_started_at
         sessions[name] = session
         self._save(sessions)
         return session
@@ -185,8 +212,11 @@ class Manager:
             os.killpg(session.pid, signal.SIGTERM)
             with Path(session.log_path).open("ab") as output:
                 _write_manager_event(output, "turn_stop_requested", session, pid=session.pid)
+            if session.turn_started_at:
+                session.active_seconds += time.time() - session.turn_started_at
         session.pid = None
         session.state = "stopped"
+        session.turn_started_at = None
         session.updated_at = time.time()
         sessions[name] = session
         self._save(sessions)
@@ -238,6 +268,38 @@ def _tail_summary(log_path: Path) -> str | None:
     return None
 
 
+def _recent_observed_fields(log_path: Path) -> dict[str, Any]:
+    observed: dict[str, Any] = {"last_message_at": None, "model": None}
+    if not log_path.exists():
+        return observed
+    for line in reversed(_tail_lines(log_path)):
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        timestamp = _event_epoch(event.get("timestamp"))
+        if observed["last_message_at"] is None and event.get("type") in {"assistant", "user"}:
+            observed["last_message_at"] = timestamp
+        if observed["model"] is None:
+            message = event.get("message")
+            if isinstance(message, dict) and isinstance(message.get("model"), str):
+                observed["model"] = message["model"]
+        if observed["last_message_at"] is not None and observed["model"] is not None:
+            break
+    return observed
+
+
+def _event_epoch(value: Any) -> float | None:
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+    return None
+
+
 def _tail_lines(path: Path, limit: int = 200, max_bytes: int = 256 * 1024) -> list[str]:
     """Read a bounded tail so status stays cheap for long-running sessions."""
     with path.open("rb") as handle:
@@ -259,6 +321,42 @@ def _print_session(session: Session, include_summary: bool = False) -> None:
     print(json.dumps(data, indent=2))
 
 
+def _format_table(sessions: list[Session]) -> str:
+    columns = ["Name", "State", "Model", "Started", "Last message", "Active", "Directory", "Notes"]
+    rows = []
+    now = time.time()
+    for session in sessions:
+        active = session.active_seconds + ((now - session.turn_started_at) if session.turn_started_at else 0)
+        rows.append([
+            session.name,
+            session.state,
+            session.model or "—",
+            _format_time(session.created_at),
+            _format_time(session.last_message_at),
+            _format_duration(active),
+            session.cwd,
+            session.notes or "—",
+        ])
+    widths = [len(column) for column in columns]
+    for row in rows:
+        for index, cell in enumerate(row):
+            widths[index] = max(widths[index], len(cell))
+    render = lambda row: " | ".join(value.ljust(widths[index]) for index, value in enumerate(row))
+    rule = "-+-".join("-" * width for width in widths)
+    return "\n".join([render(columns), rule, *(render(row) for row in rows)]) if rows else "No sessions."
+
+
+def _format_time(value: float | None) -> str:
+    return datetime.fromtimestamp(value).astimezone().strftime("%Y-%m-%d %H:%M") if value else "—"
+
+
+def _format_duration(seconds: float) -> str:
+    total = int(seconds)
+    hours, remainder = divmod(total, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours}:{minutes:02d}:{seconds:02d}"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--state-dir", type=Path, default=DEFAULT_STATE_DIR)
@@ -273,7 +371,8 @@ def build_parser() -> argparse.ArgumentParser:
     send = sub.add_parser("send", help="send a follow-up prompt to an idle session")
     send.add_argument("name")
     send.add_argument("--prompt", required=True)
-    sub.add_parser("list", help="list all named sessions")
+    listing = sub.add_parser("list", help="list all named sessions")
+    listing.add_argument("--format", choices=("table", "json"), default="table")
     status = sub.add_parser("status", help="show compact recent status")
     status.add_argument("name")
     stop = sub.add_parser("stop", help="stop the active turn")
@@ -298,7 +397,11 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "send":
             _print_session(manager.run_turn(args.name, args.prompt))
         elif args.command == "list":
-            print(json.dumps([asdict(session) for session in manager.sessions().values()], indent=2))
+            sessions = list(manager.sessions().values())
+            if args.format == "json":
+                print(json.dumps([asdict(session) for session in sessions], indent=2))
+            else:
+                print(_format_table(sessions))
         elif args.command == "status":
             session = manager.sessions().get(args.name)
             if not session:

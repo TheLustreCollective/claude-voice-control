@@ -81,3 +81,9 @@ control handle; the working directory never changes when the session is
 resumed. `--notes` is free-form text for human context, while `--metadata`
 stores a JSON object for structured routing details such as an issue key,
 owner, or project type. Both are included in `list` and `status` output.
+
+`list` renders a compact table for conversational use. It includes name, state,
+model, creation time, last message time, cumulative active time, working
+directory, and notes. Use `list --format json` when another program needs the
+full records. The metadata includes `startup_command`, a redacted command array
+with `<prompt>` in place of the original prompt.

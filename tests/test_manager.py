@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from claude_voice_control.cli import Manager, _tail_lines
+from claude_voice_control.cli import Manager, Session, _format_table, _tail_lines
 
 
 class ManagerTests(unittest.TestCase):
@@ -24,8 +24,6 @@ class ManagerTests(unittest.TestCase):
             # Exercise persistence without launching a real subprocess.
             record = manager.sessions()
             self.assertEqual(record, {})
-            from claude_voice_control.cli import Session
-
             example = Session("demo", "session-1", "/tmp", "/tmp/demo.jsonl", "idle", notes="Investigate", metadata={"ticket": "TLU-222"})
             manager._save({"demo": example})
             reloaded = manager.sessions()["demo"]
@@ -34,6 +32,15 @@ class ManagerTests(unittest.TestCase):
             updated = manager.update("demo", notes="Ready for review", merge_metadata={"owner": "Patrick"})
             self.assertEqual(updated.notes, "Ready for review")
             self.assertEqual(updated.metadata, {"ticket": "TLU-222", "owner": "Patrick"})
+
+    def test_table_includes_session_context(self) -> None:
+        table = _format_table([
+            Session("demo", "session-1", "/work/demo", "/tmp/demo.jsonl", "idle", notes="Investigate", model="claude-opus-5"),
+        ])
+        self.assertIn("Last message", table)
+        self.assertIn("claude-opus-5", table)
+        self.assertIn("/work/demo", table)
+        self.assertIn("Investigate", table)
 
 
 if __name__ == "__main__":

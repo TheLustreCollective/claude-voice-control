@@ -107,6 +107,7 @@ class Manager:
             raise ValueError("a resumed session must use its original working directory")
 
         log = Path(session.log_path)
+        log.parent.mkdir(parents=True, exist_ok=True)
         command = [
             self.cctty,
             "--print",
@@ -118,6 +119,7 @@ class Manager:
             prompt,
         ]
         with log.open("ab") as output:
+            _write_manager_event(output, "turn_starting", session)
             process = subprocess.Popen(
                 command,
                 cwd=session.cwd,
@@ -126,6 +128,7 @@ class Manager:
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
+            _write_manager_event(output, "turn_started", session, pid=process.pid)
         session.pid = process.pid
         session.state = "running"
         session.last_error = None
@@ -141,6 +144,8 @@ class Manager:
             raise ValueError(f"unknown session '{name}'")
         if session.state == "running" and session.pid:
             os.killpg(session.pid, signal.SIGTERM)
+            with Path(session.log_path).open("ab") as output:
+                _write_manager_event(output, "turn_stop_requested", session, pid=session.pid)
         session.pid = None
         session.state = "stopped"
         session.updated_at = time.time()
@@ -160,6 +165,18 @@ def _last_result(log_path: Path) -> dict[str, Any] | None:
         if event.get("type") == "result":
             return event
     return None
+
+
+def _write_manager_event(output: Any, event_type: str, session: Session, **extra: Any) -> None:
+    event = {
+        "type": f"manager_{event_type}",
+        "timestamp": time.time(),
+        "name": session.name,
+        "session_id": session.session_id,
+        **extra,
+    }
+    output.write((json.dumps(event) + "\n").encode())
+    output.flush()
 
 
 def _tail_summary(log_path: Path) -> str | None:
@@ -215,6 +232,9 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("name")
     stop = sub.add_parser("stop", help="stop the active turn")
     stop.add_argument("name")
+    logs = sub.add_parser("events", help="print a bounded recent event tail")
+    logs.add_argument("name")
+    logs.add_argument("--lines", type=int, default=40)
     return parser
 
 
@@ -235,6 +255,12 @@ def main(argv: list[str] | None = None) -> int:
             _print_session(session, include_summary=True)
         elif args.command == "stop":
             _print_session(manager.stop(args.name))
+        elif args.command == "events":
+            session = manager.sessions().get(args.name)
+            if not session:
+                raise ValueError(f"unknown session '{args.name}'")
+            for line in _tail_lines(Path(session.log_path), limit=args.lines):
+                print(line)
     except (OSError, ValueError) as exc:
         print(f"claude-voice-control: {exc}", file=sys.stderr)
         return 2

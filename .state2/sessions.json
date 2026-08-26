@@ -1,0 +1,13 @@
+{
+  "recovery": {
+    "name": "recovery",
+    "session_id": "69e66958-da1e-4873-bedc-07d6fecad000",
+    "cwd": "/Users/patrick/Documents/Codex/2026-08-25/realtime-voice-chat-4/claude-voice-control",
+    "log_path": ".state2/logs/recovery.jsonl",
+    "state": "idle",
+    "pid": null,
+    "created_at": 1787767674.732223,
+    "updated_at": 1787767680.311871,
+    "last_error": null
+  }
+}

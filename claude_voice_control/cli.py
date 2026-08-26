@@ -41,6 +41,7 @@ class Manager:
         self.state_dir = state_dir.expanduser().resolve()
         self.cctty = cctty
         self.registry_path = self.state_dir / "sessions.json"
+        self.config_path = self.state_dir / "config.json"
         self.logs_dir = self.state_dir / "logs"
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.logs_dir.mkdir(parents=True, exist_ok=True)
@@ -65,6 +66,19 @@ class Manager:
         pending.write_text(json.dumps({name: asdict(value) for name, value in sessions.items()}, indent=2) + "\n")
         pending.replace(self.registry_path)
         self.registry_path.chmod(0o600)
+
+    def config(self) -> dict[str, Any]:
+        if not self.config_path.exists():
+            return {"bootstrap_prompt": ""}
+        config = json.loads(self.config_path.read_text())
+        config.setdefault("bootstrap_prompt", "")
+        return config
+
+    def save_config(self, config: dict[str, Any]) -> None:
+        pending = self.config_path.with_suffix(".tmp")
+        pending.write_text(json.dumps(config, indent=2) + "\n")
+        pending.replace(self.config_path)
+        self.config_path.chmod(0o600)
 
     @staticmethod
     def _pid_alive(pid: int | None) -> bool:
@@ -124,6 +138,7 @@ class Manager:
     ) -> Session:
         sessions = self.sessions()
         session = sessions.get(name)
+        is_new = session is None
         if session and session.state == "running":
             raise ValueError(f"session '{name}' already has a running turn")
         if session is None:
@@ -147,6 +162,10 @@ class Manager:
 
         log = Path(session.log_path)
         log.parent.mkdir(parents=True, exist_ok=True)
+        effective_prompt = prompt
+        bootstrap_prompt = self.config().get("bootstrap_prompt", "") if is_new else ""
+        if bootstrap_prompt:
+            effective_prompt = f"{bootstrap_prompt.rstrip()}\n\nTask for this session:\n{prompt}"
         command = [
             self.cctty,
             "--print",
@@ -155,12 +174,14 @@ class Manager:
             "--no-chrome",
             "--session-id",
             session.session_id,
-            prompt,
+            effective_prompt,
         ]
         session.metadata = {
             **(session.metadata or {}),
             "startup_command": [*command[:-1], "<prompt>"],
         }
+        if bootstrap_prompt:
+            session.metadata["bootstrap_prompt_applied"] = True
         with log.open("ab") as output:
             _write_manager_event(output, "turn_starting", session)
             process = subprocess.Popen(
@@ -385,6 +406,11 @@ def build_parser() -> argparse.ArgumentParser:
     logs = sub.add_parser("events", help="print a bounded recent event tail")
     logs.add_argument("name")
     logs.add_argument("--lines", type=int, default=40)
+    config = sub.add_parser("config", help="show or change local controller configuration")
+    config_sub = config.add_subparsers(dest="config_command", required=True)
+    config_sub.add_parser("show", help="show the local configuration")
+    bootstrap = config_sub.add_parser("set-bootstrap", help="set the prompt prepended to new sessions")
+    bootstrap.add_argument("--text", required=True)
     return parser
 
 
@@ -417,6 +443,14 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError(f"unknown session '{args.name}'")
             for line in _tail_lines(Path(session.log_path), limit=args.lines):
                 print(line)
+        elif args.command == "config":
+            if args.config_command == "show":
+                print(json.dumps(manager.config(), indent=2))
+            elif args.config_command == "set-bootstrap":
+                config = manager.config()
+                config["bootstrap_prompt"] = args.text
+                manager.save_config(config)
+                print(json.dumps(config, indent=2))
     except (OSError, ValueError) as exc:
         print(f"claude-voice-control: {exc}", file=sys.stderr)
         return 2

@@ -42,6 +42,13 @@ class ManagerTests(unittest.TestCase):
         self.assertIn("/work/demo", table)
         self.assertIn("Investigate", table)
 
+    def test_bootstrap_prompt_is_private_durable_config(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = Manager(Path(directory) / "state", "cctty")
+            manager.save_config({"bootstrap_prompt": "Read AGENTS.md first."})
+            self.assertEqual(manager.config()["bootstrap_prompt"], "Read AGENTS.md first.")
+            self.assertEqual(manager.config_path.stat().st_mode & 0o777, 0o600)
+
 
 if __name__ == "__main__":
     unittest.main()

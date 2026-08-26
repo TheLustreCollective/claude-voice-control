@@ -47,6 +47,10 @@ python3 -m claude_voice_control stop research
 # Add a note or metadata later, without disrupting the session.
 python3 -m claude_voice_control update research \
   --merge-metadata '{"owner":"Patrick"}'
+
+# Apply durable instructions to each newly created session.
+python3 -m claude_voice_control config set-bootstrap \
+  --text "Before starting work, read and follow /Users/patrick/AGENTS.md."
 ```
 
 By default state is private and local under
@@ -87,3 +91,11 @@ model, creation time, last message time, cumulative active time, working
 directory, and notes. Use `list --format json` when another program needs the
 full records. The metadata includes `startup_command`, a redacted command array
 with `<prompt>` in place of the original prompt.
+
+## Bootstrap prompt
+
+The local `bootstrap_prompt` is prepended to the first task prompt of each new
+named session. It is not repeated on `send`, so it behaves like session setup
+rather than accumulating instructions on every turn. `config set-bootstrap`
+stores it in the private controller state directory, and a session records
+`bootstrap_prompt_applied` in its metadata for auditability.

@@ -33,8 +33,8 @@ class Manager:
     def __init__(self, state_dir: Path, cctty: str) -> None:
         self.state_dir = state_dir.expanduser().resolve()
         self.cctty = cctty
-        self.registry_path = state_dir / "sessions.json"
-        self.logs_dir = state_dir / "logs"
+        self.registry_path = self.state_dir / "sessions.json"
+        self.logs_dir = self.state_dir / "logs"
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.logs_dir.mkdir(parents=True, exist_ok=True)
 

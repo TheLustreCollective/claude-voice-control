@@ -5,4 +5,4 @@ __pycache__/
 *.egg-info/
 
 # Runtime state is private, not repository content.
-.state/
+.state*/

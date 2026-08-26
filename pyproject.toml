@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude-voice-control"
+version = "0.1.0"
+description = "Structured local lifecycle control for multiple Claude Code sessions"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+
+[project.scripts]
+claude-voice-control = "claude_voice_control.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["claude_voice_control*"]

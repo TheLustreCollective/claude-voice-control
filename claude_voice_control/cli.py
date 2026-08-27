@@ -253,6 +253,33 @@ class Manager:
         if not reply.get("ok"):
             raise OSError(reply.get("error", "session host rejected the prompt"))
 
+    def interrupt(self, name: str) -> Session:
+        sessions = self.sessions()
+        session = sessions.get(name)
+        if not session:
+            raise ValueError(f"unknown session '{name}'")
+        if session.state != "running" or not session.pid:
+            raise ValueError(f"session '{name}' has no running turn")
+        sock_path = self._socket_path(name)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(10)
+            client.connect(str(sock_path))
+            client.sendall(b'{"type":"interrupt"}')
+            reply = json.loads(client.recv(1024 * 1024).decode())
+        if not reply.get("ok"):
+            raise OSError(reply.get("error", "session host rejected the interrupt"))
+        now = time.time()
+        if session.turn_started_at:
+            session.active_seconds += now - session.turn_started_at
+        session.turn_started_at = None
+        session.state = "idle"
+        session.updated_at = now
+        with Path(session.log_path).open("ab") as output:
+            _write_manager_event(output, "turn_interrupt_requested", session, pid=session.pid)
+        sessions[name] = session
+        self._save(sessions)
+        return session
+
     def update(
         self,
         name: str,
@@ -441,6 +468,37 @@ def _event_epoch(value: Any) -> float | None:
     return None
 
 
+def _chat_text(value: Any) -> str:
+    """Extract readable text from Claude message content, omitting tool JSON."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "\n".join(part for item in value if (part := _chat_text(item)))
+    if isinstance(value, dict):
+        if isinstance(value.get("text"), str):
+            return value["text"]
+        return _chat_text(value.get("content"))
+    return ""
+
+
+def _print_chat(log_path: Path, limit: int) -> None:
+    messages: list[tuple[str, str]] = []
+    for line in _tail_lines(log_path, limit=max(200, limit * 8)):
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        kind = event.get("type")
+        if kind not in {"user", "assistant"}:
+            continue
+        message = event.get("message", event)
+        text = _chat_text(message.get("content") if isinstance(message, dict) else message).strip()
+        if text:
+            messages.append(("You" if kind == "user" else "Claude", text))
+    for speaker, text in messages[-limit:]:
+        print(f"{speaker}: {text}\n")
+
+
 def _tail_lines(path: Path, limit: int = 200, max_bytes: int = 256 * 1024) -> list[str]:
     """Read a bounded tail so status stays cheap for long-running sessions."""
     with path.open("rb") as handle:
@@ -523,6 +581,8 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("name")
     stop = sub.add_parser("stop", help="stop the active turn")
     stop.add_argument("name")
+    interrupt = sub.add_parser("interrupt", help="send Ctrl-C to the active Claude turn")
+    interrupt.add_argument("name")
     archive = sub.add_parser("archive", help="hide a completed session from the active list")
     archive.add_argument("name")
     unarchive = sub.add_parser("unarchive", help="return a session to the active list")
@@ -538,6 +598,9 @@ def build_parser() -> argparse.ArgumentParser:
     logs = sub.add_parser("events", help="print a bounded recent event tail")
     logs.add_argument("name")
     logs.add_argument("--lines", type=int, default=40)
+    chat = sub.add_parser("chat", help="show recent user/Claude messages as readable chat")
+    chat.add_argument("name")
+    chat.add_argument("--messages", type=int, default=20)
     config = sub.add_parser("config", help="show or change local controller configuration")
     config_sub = config.add_subparsers(dest="config_command", required=True)
     config_sub.add_parser("show", help="show the local configuration")
@@ -571,6 +634,8 @@ def main(argv: list[str] | None = None) -> int:
             _print_session(session, include_summary=True)
         elif args.command == "stop":
             _print_session(manager.stop(args.name))
+        elif args.command == "interrupt":
+            _print_session(manager.interrupt(args.name))
         elif args.command == "archive":
             _print_session(manager.archive(args.name))
         elif args.command == "unarchive":
@@ -585,6 +650,11 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError(f"unknown session '{args.name}'")
             for line in _tail_lines(Path(session.log_path), limit=args.lines):
                 print(line)
+        elif args.command == "chat":
+            session = manager.sessions().get(args.name)
+            if not session:
+                raise ValueError(f"unknown session '{args.name}'")
+            _print_chat(Path(session.log_path), max(1, args.messages))
         elif args.command == "config":
             if args.config_command == "show":
                 print(json.dumps(manager.config(), indent=2))

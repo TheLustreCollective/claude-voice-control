@@ -67,14 +67,17 @@ def main(argv: list[str] | None = None) -> int:
                 with connection:
                     try:
                         request = json.loads(connection.recv(1024 * 1024).decode())
-                        if request.get("type") != "prompt" or not isinstance(request.get("prompt"), str):
-                            raise ValueError("expected a prompt request")
-                        payload = {
-                            "type": "user",
-                            "message": {"role": "user", "content": [{"type": "text", "text": request["prompt"]}]},
-                        }
-                        process.stdin.write((json.dumps(payload) + "\n").encode())
-                        process.stdin.flush()
+                        if request.get("type") == "interrupt":
+                            os.killpg(process.pid, signal.SIGINT)
+                        elif request.get("type") == "prompt" and isinstance(request.get("prompt"), str):
+                            payload = {
+                                "type": "user",
+                                "message": {"role": "user", "content": [{"type": "text", "text": request["prompt"]}]},
+                            }
+                            process.stdin.write((json.dumps(payload) + "\n").encode())
+                            process.stdin.flush()
+                        else:
+                            raise ValueError("expected a prompt or interrupt request")
                         connection.sendall(b'{"ok":true}\n')
                     except (ValueError, json.JSONDecodeError, BrokenPipeError) as exc:
                         connection.sendall(json.dumps({"ok": False, "error": str(exc)}).encode() + b"\n")

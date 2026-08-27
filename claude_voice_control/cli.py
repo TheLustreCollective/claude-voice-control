@@ -5,6 +5,7 @@ from datetime import datetime
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -15,6 +16,16 @@ from typing import Any
 
 
 DEFAULT_STATE_DIR = Path.home() / ".local" / "share" / "claude-voice-control"
+DEFAULT_BOOTSTRAP_PROMPT = """Before starting work, read and follow /Users/patrick/AGENTS.md.
+
+You are a worker managed by a supervising ChatGPT/Codex agent. After reading
+the instructions, carry out the task in the same turn: use tools and perform
+the requested work rather than stopping after acknowledging a plan. When the
+task is actually finished, start your final response with `WORKER_STATUS:
+COMPLETE`. If you need a decision or cannot proceed, start it with
+`WORKER_STATUS: NEEDS_INPUT` or `WORKER_STATUS: BLOCKED`. If you finish a
+turn but the task remains unfinished, start the response with
+`WORKER_STATUS: IN_PROGRESS` and state the concrete next action."""
 
 
 @dataclass
@@ -35,6 +46,7 @@ class Session:
     model: str | None = None
     last_error: str | None = None
     archived_at: float | None = None
+    task_state: str = "in_progress"
 
 
 class Manager:
@@ -44,8 +56,10 @@ class Manager:
         self.registry_path = self.state_dir / "sessions.json"
         self.config_path = self.state_dir / "config.json"
         self.logs_dir = self.state_dir / "logs"
+        self.hosts_dir = self.state_dir / "hosts"
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.logs_dir.mkdir(parents=True, exist_ok=True)
+        self.hosts_dir.mkdir(parents=True, exist_ok=True)
 
     def _load(self) -> dict[str, Session]:
         if not self.registry_path.exists():
@@ -60,6 +74,7 @@ class Manager:
             value.setdefault("active_seconds", 0.0)
             value.setdefault("model", None)
             value.setdefault("archived_at", None)
+            value.setdefault("task_state", "in_progress")
             sessions[name] = Session(**value)
         return sessions
 
@@ -71,9 +86,9 @@ class Manager:
 
     def config(self) -> dict[str, Any]:
         if not self.config_path.exists():
-            return {"bootstrap_prompt": ""}
+            return {"bootstrap_prompt": DEFAULT_BOOTSTRAP_PROMPT}
         config = json.loads(self.config_path.read_text())
-        config.setdefault("bootstrap_prompt", "")
+        config.setdefault("bootstrap_prompt", DEFAULT_BOOTSTRAP_PROMPT)
         return config
 
     def save_config(self, config: dict[str, Any]) -> None:
@@ -96,18 +111,33 @@ class Manager:
 
     def _refresh(self, session: Session) -> Session:
         self._refresh_observed_fields(session)
-        if session.state == "running" and not self._pid_alive(session.pid):
-            result = _last_result(Path(session.log_path))
-            if result and not result.get("is_error", False):
-                session.state = "idle"
-            else:
+        if session.state == "running":
+            result = _last_result_after(Path(session.log_path), int(session.metadata.get("turn_log_offset", 0)))
+            if result:
+                if result.get("is_error", False):
+                    session.state = "failed"
+                    session.last_error = result.get("result", "Claude returned an error")
+                else:
+                    session.state = "idle"
+                now = time.time()
+                if session.turn_started_at:
+                    session.active_seconds += now - session.turn_started_at
+                session.turn_started_at = None
+                session.updated_at = now
+                reported = _worker_status(Path(session.log_path))
+                if reported:
+                    session.task_state = reported
+        if session.pid and not self._pid_alive(session.pid):
+            if session.state == "running":
                 session.state = "failed"
-                session.last_error = (result or {}).get("result", "cctty exited without a result")
+                session.last_error = "the persistent session host exited before a result"
+                if session.turn_started_at:
+                    session.active_seconds += time.time() - session.turn_started_at
+                session.turn_started_at = None
+            elif session.state == "idle":
+                session.state = "stopped"
             session.pid = None
             now = time.time()
-            if session.turn_started_at:
-                session.active_seconds += now - session.turn_started_at
-            session.turn_started_at = None
             session.updated_at = now
         return session
 
@@ -168,55 +198,60 @@ class Manager:
         bootstrap_prompt = self.config().get("bootstrap_prompt", "") if is_new else ""
         if bootstrap_prompt:
             effective_prompt = f"{bootstrap_prompt.rstrip()}\n\nTask for this session:\n{prompt}"
-        command = [
-            self.cctty,
-            "--print",
-            "--input-format",
-            "stream-json",
-            "--output-format",
-            "stream-json",
-            "--no-chrome",
-        ]
-        if is_new:
-            command.extend(["--session-id", session.session_id])
-        else:
-            command.extend(["--resume", session.session_id])
-        command.append(effective_prompt)
+        command = [self.cctty, "--print", "--input-format", "stream-json", "--output-format", "stream-json", "--no-chrome"]
+        command.extend(["--session-id" if is_new else "--resume", session.session_id])
         session.metadata = {
             **(session.metadata or {}),
-            "startup_command": [*command[:-1], "<prompt>"],
+            "startup_command": [*command, "<prompt>"],
         }
         if bootstrap_prompt:
             session.metadata["bootstrap_prompt_applied"] = True
+        sessions[name] = session
+        # The background host reads this durable record before it starts Claude.
+        self._save(sessions)
+        if not self._pid_alive(session.pid):
+            session.pid = self._start_host(session, resume=not is_new)
         with log.open("ab") as output:
-            _write_manager_event(output, "turn_starting", session)
-            process = subprocess.Popen(
-                command,
-                cwd=session.cwd,
-                stdin=subprocess.PIPE,
-                stdout=output,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
-            assert process.stdin is not None
-            stream_input = {
-                "type": "user",
-                "message": {
-                    "role": "user",
-                    "content": [{"type": "text", "text": effective_prompt}],
-                },
-            }
-            process.stdin.write((json.dumps(stream_input) + "\n").encode())
-            process.stdin.close()
-            _write_manager_event(output, "turn_started", session, pid=process.pid)
-        session.pid = process.pid
+            session.metadata["turn_log_offset"] = log.stat().st_size
+            _write_manager_event(output, "turn_queued", session, pid=session.pid)
+        self._send_to_host(session.name, effective_prompt)
         session.state = "running"
+        session.task_state = "in_progress"
         session.last_error = None
         session.turn_started_at = time.time()
         session.updated_at = session.turn_started_at
         sessions[name] = session
         self._save(sessions)
         return session
+
+    def _socket_path(self, name: str) -> Path:
+        return self.hosts_dir / f"{name}.sock"
+
+    def _start_host(self, session: Session, resume: bool) -> int:
+        command = [sys.executable, "-m", "claude_voice_control.host", "--state-dir", str(self.state_dir), "--name", session.name, "--cctty", self.cctty]
+        if resume:
+            command.append("--resume")
+        process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        sock_path = self._socket_path(session.name)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if sock_path.exists():
+                return process.pid
+            if process.poll() is not None:
+                raise OSError(f"session host exited with status {process.returncode}")
+            time.sleep(0.05)
+        os.killpg(process.pid, signal.SIGTERM)
+        raise OSError("session host did not create its control socket")
+
+    def _send_to_host(self, name: str, prompt: str) -> None:
+        sock_path = self._socket_path(name)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(10)
+            client.connect(str(sock_path))
+            client.sendall(json.dumps({"type": "prompt", "prompt": prompt}).encode())
+            reply = json.loads(client.recv(1024 * 1024).decode())
+        if not reply.get("ok"):
+            raise OSError(reply.get("error", "session host rejected the prompt"))
 
     def update(
         self,
@@ -311,6 +346,23 @@ def _last_result(log_path: Path) -> dict[str, Any] | None:
     return None
 
 
+def _last_result_after(log_path: Path, offset: int) -> dict[str, Any] | None:
+    """Return the latest result emitted after a queued prompt's log offset."""
+    if not log_path.exists():
+        return None
+    with log_path.open("rb") as handle:
+        handle.seek(max(0, offset))
+        lines = handle.read().decode(errors="replace").splitlines()
+    for line in reversed(lines):
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") == "result":
+            return event
+    return None
+
+
 def _write_manager_event(output: Any, event_type: str, session: Session, **extra: Any) -> None:
     event = {
         "type": f"manager_{event_type}",
@@ -340,6 +392,20 @@ def _tail_summary(log_path: Path) -> str | None:
                     return text[-800:]
         if event.get("type") == "result" and isinstance(event.get("result"), str):
             return event["result"][-800:]
+    return None
+
+
+def _worker_status(log_path: Path) -> str | None:
+    """Extract the explicit worker task state, never infer it from a finished turn."""
+    summary = _tail_summary(log_path)
+    if not summary:
+        return None
+    marker = "WORKER_STATUS:"
+    for line in summary.splitlines():
+        if line.upper().startswith(marker):
+            value = line.split(":", 1)[1].strip().lower().replace("-", "_").replace(" ", "_")
+            if value in {"complete", "in_progress", "needs_input", "blocked"}:
+                return value
     return None
 
 
@@ -397,7 +463,7 @@ def _print_session(session: Session, include_summary: bool = False) -> None:
 
 
 def _format_table(sessions: list[Session]) -> str:
-    columns = ["Name", "State", "Archive", "Model", "Started", "Last message", "Active", "Directory", "Notes"]
+    columns = ["Name", "Turn", "Task", "Archive", "Model", "Started", "Last message", "Active", "Directory", "Notes"]
     rows = []
     now = time.time()
     for session in sessions:
@@ -405,6 +471,7 @@ def _format_table(sessions: list[Session]) -> str:
         rows.append([
             session.name,
             session.state,
+            session.task_state,
             "archived" if session.archived_at else "active",
             session.model or "—",
             _format_time(session.created_at),

@@ -11,11 +11,16 @@ resume/restart a real continuation of the named Claude conversation.
 ## What it does today
 
 - starts named sessions in the background;
+- keeps a small local session host and Claude's streaming input pipe alive
+  between turns, rather than treating a process exit as the normal boundary;
 - associates every session with the working directory where Claude Code runs;
 - keeps durable human-readable notes and arbitrary JSON metadata per session;
 - stores their stable Claude session IDs and event logs locally;
 - reports running, idle, failed, and stopped state without replaying an entire
   terminal transcript;
+- tracks worker task state separately from the state of the most recent Claude
+  turn, so an "I'll start by reading the instructions" response is not treated
+  as task completion;
 - sends a follow-up prompt by resuming the named Claude session; and
 - stops a running turn safely.
 
@@ -84,6 +89,20 @@ Each named session has one active turn at a time:
 - `failed` — cctty exited unsuccessfully; and
 - `stopped` — the manager terminated the active turn.
 
+Behind each active named session is a local Unix-socket host process. It owns
+one cctty/Claude process, retains its stdin pipe while Claude is idle, and
+accepts later prompts through the private socket. Consequently, `send` uses
+the same live Claude process when it is healthy. If that host genuinely exits,
+the next `send`/`restart` creates a replacement with `--resume` and the stored
+Claude session ID.
+
+`Turn` and `Task` are deliberately separate in the session table. A turn is
+`idle` once Claude has responded, but the task stays `in_progress` until the
+worker explicitly reports `WORKER_STATUS: COMPLETE`, `BLOCKED`, or
+`NEEDS_INPUT` in its final response. This lets the supervising ChatGPT/Codex
+agent send a follow-up or surface an actionable question instead of mistaking a
+brief planning response for completed work.
+
 Sessions are active by default. `archive` moves a non-running session out of
 the default `list` view without deleting its registry entry, JSONL log, or
 Claude session ID. `list --archived` and `list --all` expose historical
@@ -114,7 +133,10 @@ with `<prompt>` in place of the original prompt.
 ## Bootstrap prompt
 
 The local `bootstrap_prompt` is prepended to the first task prompt of each new
-named session. It is not repeated on `send`, so it behaves like session setup
-rather than accumulating instructions on every turn. `config set-bootstrap`
-stores it in the private controller state directory, and a session records
-`bootstrap_prompt_applied` in its metadata for auditability.
+named session. Its default directs workers to read Patrick's `AGENTS.md`, do
+the requested work rather than stopping after a plan, and use an explicit
+`WORKER_STATUS` marker. It is not repeated on `send`, so it behaves like
+session setup rather than accumulating instructions on every turn. `config
+set-bootstrap` stores a customized version in the private controller state
+directory, and a session records `bootstrap_prompt_applied` in its metadata for
+auditability.

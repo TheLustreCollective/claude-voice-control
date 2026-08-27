@@ -9,6 +9,8 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 
@@ -36,15 +38,67 @@ def main(argv: list[str] | None = None) -> int:
     log = Path(session["log_path"])
     log.parent.mkdir(parents=True, exist_ok=True)
     with log.open("ab") as output:
+        stdin_lock = threading.Lock()
+        output_lock = threading.Lock()
+        auto_count = 0
         process = subprocess.Popen(
             command,
             cwd=session["cwd"],
             stdin=subprocess.PIPE,
-            stdout=output,
+            stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
         assert process.stdin is not None
+        assert process.stdout is not None
+
+        def write_prompt(prompt: str) -> None:
+            payload = {
+                "type": "user",
+                "message": {"role": "user", "content": [{"type": "text", "text": prompt}]},
+            }
+            with stdin_lock:
+                process.stdin.write((json.dumps(payload) + "\n").encode())
+                process.stdin.flush()
+
+        def relay_output() -> None:
+            nonlocal auto_count
+            for raw_line in process.stdout:
+                with output_lock:
+                    output.write(raw_line)
+                    output.flush()
+                try:
+                    event = json.loads(raw_line)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("type") != "result" or not isinstance(event.get("result"), str):
+                    continue
+                latest = json.loads((state_dir / "sessions.json").read_text()).get(args.name, {})
+                metadata = latest.get("metadata", {})
+                result = event["result"]
+                enabled = bool(metadata.get("auto_continue", False))
+                limit = max(0, int(metadata.get("auto_continue_limit", 10)))
+                if enabled and "WORKER_STATUS: IN_PROGRESS" in result.upper() and auto_count < limit:
+                    auto_count += 1
+                    manager_event = {
+                        "type": "manager_auto_continue_queued",
+                        "timestamp": time.time(),
+                        "name": args.name,
+                        "session_id": latest.get("session_id"),
+                        "auto_continue_count": auto_count,
+                        "auto_continue_limit": limit,
+                    }
+                    with output_lock:
+                        output.write((json.dumps(manager_event) + "\n").encode())
+                        output.flush()
+                    write_prompt(
+                        "Continue the assigned task now from the current context. Perform the next safe concrete "
+                        "steps rather than stopping at a plan. End with WORKER_STATUS: COMPLETE, IN_PROGRESS, "
+                        "NEEDS_INPUT, or BLOCKED."
+                    )
+
+        relay = threading.Thread(target=relay_output, name=f"{args.name}-output", daemon=True)
+        relay.start()
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         listener.bind(str(sock_path))
         os.chmod(sock_path, 0o600)
@@ -70,12 +124,7 @@ def main(argv: list[str] | None = None) -> int:
                         if request.get("type") == "interrupt":
                             os.killpg(process.pid, signal.SIGINT)
                         elif request.get("type") == "prompt" and isinstance(request.get("prompt"), str):
-                            payload = {
-                                "type": "user",
-                                "message": {"role": "user", "content": [{"type": "text", "text": request["prompt"]}]},
-                            }
-                            process.stdin.write((json.dumps(payload) + "\n").encode())
-                            process.stdin.flush()
+                            write_prompt(request["prompt"])
                         else:
                             raise ValueError("expected a prompt or interrupt request")
                         connection.sendall(b'{"ok":true}\n')

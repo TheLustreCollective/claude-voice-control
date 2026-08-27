@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from claude_voice_control.cli import Manager, Session, _format_table, _tail_lines
+from claude_voice_control.cli import Manager, Session, _format_table, _last_result_after, _tail_lines
 
 
 class ManagerTests(unittest.TestCase):
@@ -18,6 +18,18 @@ class ManagerTests(unittest.TestCase):
             log = Path(directory) / "events.jsonl"
             log.write_text("".join(f"event-{number}\n" for number in range(500)))
             self.assertEqual(_tail_lines(log, limit=3), ["event-497", "event-498", "event-499"])
+
+    def test_auto_continue_boundary_ignores_previous_result(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "events.jsonl"
+            log.write_text(
+                '{"type":"result","result":"WORKER_STATUS: IN_PROGRESS"}\n'
+                '{"type":"manager_auto_continue_queued"}\n'
+            )
+            self.assertIsNone(_last_result_after(log, 0))
+            with log.open("a") as handle:
+                handle.write('{"type":"result","result":"WORKER_STATUS: COMPLETE"}\n')
+            self.assertEqual(_last_result_after(log, 0)["result"], "WORKER_STATUS: COMPLETE")
 
     def test_notes_and_metadata_survive_reload(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

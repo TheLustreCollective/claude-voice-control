@@ -134,6 +134,11 @@ After a Claude turn returns, the turn state is `waiting` while the overall task
 remains `in_progress`; this is distinct from a completed task and is shown in
 `list` and `status`.
 
+Set `auto_continue: true` and an `auto_continue_limit` in session metadata to
+let the persistent host enqueue another turn whenever Claude explicitly ends
+with `WORKER_STATUS: IN_PROGRESS`. The host stops automatically for
+`COMPLETE`, `NEEDS_INPUT`, or `BLOCKED`, and the limit prevents runaway loops.
+
 ## Bootstrap prompt
 
 The local `bootstrap_prompt` is prepended to the first task prompt of each new

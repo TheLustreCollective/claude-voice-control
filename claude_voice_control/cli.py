@@ -386,14 +386,17 @@ def _last_result_after(log_path: Path, offset: int) -> dict[str, Any] | None:
     with log_path.open("rb") as handle:
         handle.seek(max(0, offset))
         lines = handle.read().decode(errors="replace").splitlines()
-    for line in reversed(lines):
+    candidate = None
+    for line in lines:
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
         if event.get("type") == "result":
-            return event
-    return None
+            candidate = event
+        elif event.get("type") == "manager_auto_continue_queued":
+            candidate = None
+    return candidate
 
 
 def _write_manager_event(output: Any, event_type: str, session: Session, **extra: Any) -> None:

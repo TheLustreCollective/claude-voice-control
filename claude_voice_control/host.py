@@ -14,11 +14,16 @@ import time
 from pathlib import Path
 
 
+DEFAULT_AUTO_CONTINUE_LIMIT = 1000
+
+
 def _socket_path(state_dir: Path, name: str) -> Path:
     return state_dir / "hosts" / f"{name}.sock"
 
 
-def _auto_continue_reason(result: str, markerless_enabled: bool) -> str | None:
+def _auto_continue_reason(result: str, markerless_enabled: bool, is_error: bool = False) -> str | None:
+    if is_error:
+        return None
     upper_result = result.upper()
     if any(
         marker in upper_result
@@ -58,7 +63,9 @@ def main(argv: list[str] | None = None) -> int:
     with log.open("ab") as output:
         stdin_lock = threading.Lock()
         output_lock = threading.Lock()
+        auto_lock = threading.Lock()
         auto_count = 0
+        pending_result: dict[str, object] | None = None
         process = subprocess.Popen(
             command,
             cwd=session["cwd"],
@@ -79,8 +86,69 @@ def main(argv: list[str] | None = None) -> int:
                 process.stdin.write((json.dumps(payload) + "\n").encode())
                 process.stdin.flush()
 
+        def reconsider_auto_continue() -> None:
+            """Queue a pending continuation using the latest live metadata.
+
+            A result remains pending when auto-continuation is disabled or its
+            current cap is exhausted. This lets a later metadata update (for
+            example, raising the cap from 12 to 20) wake the waiting worker
+            without requiring a manual prompt.
+            """
+            nonlocal auto_count, pending_result
+            manager_event = None
+            continuation_prompt = None
+            with auto_lock:
+                if pending_result is None:
+                    return
+                latest = json.loads((state_dir / "sessions.json").read_text()).get(args.name, {})
+                metadata = latest.get("metadata", {})
+                enabled = bool(metadata.get("auto_continue", False))
+                markerless_enabled = bool(metadata.get("auto_continue_markerless", False))
+                limit = max(0, int(metadata.get("auto_continue_limit", DEFAULT_AUTO_CONTINUE_LIMIT)))
+                reason = _auto_continue_reason(
+                    str(pending_result["result"]),
+                    markerless_enabled,
+                    bool(pending_result.get("is_error", False)),
+                )
+                if not enabled or not reason:
+                    return
+                if auto_count >= limit:
+                    if pending_result.get("exhausted_limit") != limit:
+                        pending_result["exhausted_limit"] = limit
+                        manager_event = {
+                            "type": "manager_auto_continue_exhausted",
+                            "timestamp": time.time(),
+                            "name": args.name,
+                            "session_id": latest.get("session_id"),
+                            "auto_continue_count": auto_count,
+                            "auto_continue_limit": limit,
+                        }
+                else:
+                    auto_count += 1
+                    pending_result = None
+                    manager_event = {
+                        "type": "manager_auto_continue_queued",
+                        "timestamp": time.time(),
+                        "name": args.name,
+                        "session_id": latest.get("session_id"),
+                        "auto_continue_count": auto_count,
+                        "auto_continue_limit": limit,
+                        "reason": reason,
+                    }
+                    continuation_prompt = (
+                        "Continue the assigned task now from the current context. Perform the next safe concrete "
+                        "steps rather than stopping at a plan. End with WORKER_STATUS: COMPLETE, IN_PROGRESS, "
+                        "NEEDS_INPUT, or BLOCKED."
+                    )
+            if manager_event is not None:
+                with output_lock:
+                    output.write((json.dumps(manager_event) + "\n").encode())
+                    output.flush()
+            if continuation_prompt is not None:
+                write_prompt(continuation_prompt)
+
         def relay_output() -> None:
-            nonlocal auto_count
+            nonlocal pending_result
             for raw_line in process.stdout:
                 with output_lock:
                     output.write(raw_line)
@@ -91,32 +159,12 @@ def main(argv: list[str] | None = None) -> int:
                     continue
                 if event.get("type") != "result" or not isinstance(event.get("result"), str):
                     continue
-                latest = json.loads((state_dir / "sessions.json").read_text()).get(args.name, {})
-                metadata = latest.get("metadata", {})
-                result = event["result"]
-                enabled = bool(metadata.get("auto_continue", False))
-                markerless_enabled = bool(metadata.get("auto_continue_markerless", False))
-                limit = max(0, int(metadata.get("auto_continue_limit", 10)))
-                reason = _auto_continue_reason(result, markerless_enabled)
-                if enabled and reason and auto_count < limit:
-                    auto_count += 1
-                    manager_event = {
-                        "type": "manager_auto_continue_queued",
-                        "timestamp": time.time(),
-                        "name": args.name,
-                        "session_id": latest.get("session_id"),
-                        "auto_continue_count": auto_count,
-                        "auto_continue_limit": limit,
-                        "reason": reason,
+                with auto_lock:
+                    pending_result = {
+                        "result": event["result"],
+                        "is_error": bool(event.get("is_error", False)),
                     }
-                    with output_lock:
-                        output.write((json.dumps(manager_event) + "\n").encode())
-                        output.flush()
-                    write_prompt(
-                        "Continue the assigned task now from the current context. Perform the next safe concrete "
-                        "steps rather than stopping at a plan. End with WORKER_STATUS: COMPLETE, IN_PROGRESS, "
-                        "NEEDS_INPUT, or BLOCKED."
-                    )
+                reconsider_auto_continue()
 
         relay = threading.Thread(target=relay_output, name=f"{args.name}-output", daemon=True)
         relay.start()
@@ -143,6 +191,7 @@ def main(argv: list[str] | None = None) -> int:
                 try:
                     connection, _ = listener.accept()
                 except socket.timeout:
+                    reconsider_auto_continue()
                     continue
                 with connection:
                     try:
@@ -150,6 +199,10 @@ def main(argv: list[str] | None = None) -> int:
                         if request.get("type") == "interrupt":
                             os.killpg(process.pid, signal.SIGINT)
                         elif request.get("type") == "prompt" and isinstance(request.get("prompt"), str):
+                            # A human/supervisor prompt supersedes any pending
+                            # automatic continuation of the preceding result.
+                            with auto_lock:
+                                pending_result = None
                             write_prompt(request["prompt"])
                         else:
                             raise ValueError("expected a prompt or interrupt request")

@@ -137,11 +137,16 @@ remains `in_progress`; this is distinct from a completed task and is shown in
 Set `auto_continue: true` and an `auto_continue_limit` in session metadata to
 let the persistent host enqueue another turn whenever Claude explicitly ends
 with `WORKER_STATUS: IN_PROGRESS`. The host stops automatically for
-`COMPLETE`, `NEEDS_INPUT`, or `BLOCKED`, and the limit prevents runaway loops.
+`COMPLETE`, `NEEDS_INPUT`, or `BLOCKED`. The continuation limit defaults to
+1,000 turns so long-running workers can operate autonomously while retaining a
+finite runaway-loop guard; set `auto_continue_limit` to override it.
 For workers that fail to emit the marker reliably, opt in to
 `auto_continue_markerless: true`; substantive markerless results then continue
 under the same cap, while errors, terminal markers, and synthetic
-`No response requested.` results stop.
+`No response requested.` results stop. If auto-continuation is enabled or its
+cap is raised while a task is waiting, the host re-evaluates that pending
+result and continues it automatically. Cap exhaustion is recorded explicitly
+in the event log rather than looking like an unexplained stall.
 
 ## Bootstrap prompt
 

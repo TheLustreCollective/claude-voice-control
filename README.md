@@ -124,11 +124,15 @@ resumed. `--notes` is free-form text for human context, while `--metadata`
 stores a JSON object for structured routing details such as an issue key,
 owner, or project type. Both are included in `list` and `status` output.
 
-`list` renders a compact table for conversational use. It includes name, state,
+`list` renders a compact table for conversational use. It includes name, turn state,
 model, creation time, last message time, cumulative active time, working
 directory, and notes. Use `list --format json` when another program needs the
 full records. The metadata includes `startup_command`, a redacted command array
 with `<prompt>` in place of the original prompt.
+
+After a Claude turn returns, the turn state is `waiting` while the overall task
+remains `in_progress`; this is distinct from a completed task and is shown in
+`list` and `status`.
 
 ## Bootstrap prompt
 

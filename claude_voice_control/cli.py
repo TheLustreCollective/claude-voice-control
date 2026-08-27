@@ -118,7 +118,9 @@ class Manager:
                     session.state = "failed"
                     session.last_error = result.get("result", "Claude returned an error")
                 else:
-                    session.state = "idle"
+                    # A completed Claude turn is not necessarily completion of
+                    # the managed assignment. Keep that distinction visible.
+                    session.state = "waiting"
                 now = time.time()
                 if session.turn_started_at:
                     session.active_seconds += now - session.turn_started_at
@@ -134,7 +136,7 @@ class Manager:
                 if session.turn_started_at:
                     session.active_seconds += time.time() - session.turn_started_at
                 session.turn_started_at = None
-            elif session.state == "idle":
+            elif session.state in {"idle", "waiting"}:
                 session.state = "stopped"
             session.pid = None
             now = time.time()

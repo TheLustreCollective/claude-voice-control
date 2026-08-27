@@ -18,6 +18,24 @@ def _socket_path(state_dir: Path, name: str) -> Path:
     return state_dir / "hosts" / f"{name}.sock"
 
 
+def _auto_continue_reason(result: str, markerless_enabled: bool) -> str | None:
+    upper_result = result.upper()
+    if any(
+        marker in upper_result
+        for marker in (
+            "WORKER_STATUS: COMPLETE",
+            "WORKER_STATUS: NEEDS_INPUT",
+            "WORKER_STATUS: BLOCKED",
+        )
+    ):
+        return None
+    if "WORKER_STATUS: IN_PROGRESS" in upper_result:
+        return "explicit_in_progress"
+    if markerless_enabled and "WORKER_STATUS:" not in upper_result and result.strip() != "No response requested.":
+        return "markerless_fallback"
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--state-dir", type=Path, required=True)
@@ -77,8 +95,10 @@ def main(argv: list[str] | None = None) -> int:
                 metadata = latest.get("metadata", {})
                 result = event["result"]
                 enabled = bool(metadata.get("auto_continue", False))
+                markerless_enabled = bool(metadata.get("auto_continue_markerless", False))
                 limit = max(0, int(metadata.get("auto_continue_limit", 10)))
-                if enabled and "WORKER_STATUS: IN_PROGRESS" in result.upper() and auto_count < limit:
+                reason = _auto_continue_reason(result, markerless_enabled)
+                if enabled and reason and auto_count < limit:
                     auto_count += 1
                     manager_event = {
                         "type": "manager_auto_continue_queued",
@@ -87,6 +107,7 @@ def main(argv: list[str] | None = None) -> int:
                         "session_id": latest.get("session_id"),
                         "auto_continue_count": auto_count,
                         "auto_continue_limit": limit,
+                        "reason": reason,
                     }
                     with output_lock:
                         output.write((json.dumps(manager_event) + "\n").encode())

@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 from claude_voice_control.cli import Manager, Session, _format_table, _last_result_after, _tail_lines
+from claude_voice_control.host import _auto_continue_reason
 
 
 class ManagerTests(unittest.TestCase):
@@ -30,6 +31,15 @@ class ManagerTests(unittest.TestCase):
             with log.open("a") as handle:
                 handle.write('{"type":"result","result":"WORKER_STATUS: COMPLETE"}\n')
             self.assertEqual(_last_result_after(log, 0)["result"], "WORKER_STATUS: COMPLETE")
+
+    def test_markerless_auto_continue_is_bounded_to_substantive_results(self) -> None:
+        self.assertEqual(_auto_continue_reason("Still building", True), "markerless_fallback")
+        self.assertEqual(
+            _auto_continue_reason("WORKER_STATUS: IN_PROGRESS\nStill building", False),
+            "explicit_in_progress",
+        )
+        self.assertIsNone(_auto_continue_reason("No response requested.", True))
+        self.assertIsNone(_auto_continue_reason("WORKER_STATUS: NEEDS_INPUT", True))
 
     def test_notes_and_metadata_survive_reload(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

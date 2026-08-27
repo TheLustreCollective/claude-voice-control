@@ -313,7 +313,7 @@ class Manager:
         session = sessions.get(name)
         if not session:
             raise ValueError(f"unknown session '{name}'")
-        if session.state == "running" and session.pid:
+        if session.pid:
             os.killpg(session.pid, signal.SIGTERM)
             with Path(session.log_path).open("ab") as output:
                 _write_manager_event(output, "turn_stop_requested", session, pid=session.pid)

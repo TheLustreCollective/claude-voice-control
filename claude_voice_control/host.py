@@ -99,6 +99,11 @@ def main(argv: list[str] | None = None) -> int:
 
         relay = threading.Thread(target=relay_output, name=f"{args.name}-output", daemon=True)
         relay.start()
+        # A resumed cctty session replays its metadata before it can reliably
+        # consume streamed input. Avoid exposing the control socket during
+        # that restoration window, or the first prompt can remain queued.
+        if args.resume:
+            time.sleep(1.0)
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         listener.bind(str(sock_path))
         os.chmod(sock_path, 0o600)

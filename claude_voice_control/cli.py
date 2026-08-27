@@ -111,6 +111,10 @@ class Manager:
 
     def _refresh(self, session: Session) -> Session:
         self._refresh_observed_fields(session)
+        # Migrate older records: a live host with unfinished task state is
+        # waiting between turns, not simply idle.
+        if session.state == "idle" and session.task_state == "in_progress" and self._pid_alive(session.pid):
+            session.state = "waiting"
         if session.state == "running":
             result = _last_result_after(Path(session.log_path), int(session.metadata.get("turn_log_offset", 0)))
             if result:
